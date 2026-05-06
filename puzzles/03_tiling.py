@@ -132,7 +132,7 @@ def explore():
 @cute.jit
 def task1():
     # An 8x8 row-major matrix has stride (?, 1) — what's the row stride?
-    flat = cute.make_layout((8, 8), stride=(???, 1))
+    flat = cute.make_layout((8, 8), stride=(8, 1))
     tiled = cute.tiled_divide(flat, (2, 2))
     cute.printf("TASK 1 tiled: {}", tiled)
     # Print just tile (2, 3) — the tile in tile-row 2, tile-col 3.
@@ -141,7 +141,7 @@ def task1():
         for jj in cutlass.range_constexpr(2):
             cute.printf("  intra=({},{}) -> {}", ii, jj, tiled(((ii, jj), 2, 3)))
     # PREDICT BEFORE RUNNING: which 4 offsets should tile (2,3) cover?
-    # your guess:
+    # your guess: {38, 39, 46, 47}
 
 
 # ----------------------------------------------------------------
@@ -153,7 +153,7 @@ def task1():
 @cute.jit
 def task2():
     flat = cute.make_layout((8, 8), stride=(8, 1))
-    tiled = cute.tiled_divide(flat, ???)  # the tile shape
+    tiled = cute.tiled_divide(flat, (4, 4))  # the tile shape
     cute.printf("TASK 2 tiled: {}", tiled)
     cute.printf("Tile (1,1):")
     for ii in cutlass.range_constexpr(4):
@@ -171,14 +171,14 @@ def task2():
 @cute.jit
 def task3():
     flat = cute.make_layout((8, 8), stride=(8, 1))
-    tiled = cute.tiled_divide(flat, ???)
+    tiled = cute.tiled_divide(flat, (2, 4))
     cute.printf("TASK 3 tiled: {}", tiled)
     cute.printf("Tile (3,1):")
     for ii in cutlass.range_constexpr(2):
         for jj in cutlass.range_constexpr(4):
             cute.printf("  intra=({},{}) -> {}", ii, jj, tiled(((ii, jj), 3, 1)))
     # PREDICT: tile (3,1) should be rows {?,?} cols {?,?,?,?} of the original.
-    # your guess:
+    # your guess: rows {6, 7} cols {4, 5, 6, 7}
 
 
 # ----------------------------------------------------------------
@@ -190,7 +190,7 @@ def task3():
 # ----------------------------------------------------------------
 @cute.jit
 def task4():
-    flat = cute.make_layout((8, 8), stride=???)  # column-major: which stride?
+    flat = cute.make_layout((8, 8), stride=(1, 8))  # column-major: which stride?
     tiled = cute.tiled_divide(flat, (2, 2))
     cute.printf("TASK 4 tiled: {}", tiled)
     cute.printf("Tile (0,0):")
@@ -198,7 +198,7 @@ def task4():
         for jj in cutlass.range_constexpr(2):
             cute.printf("  intra=({},{}) -> {}", ii, jj, tiled(((ii, jj), 0, 0)))
     # PREDICT: in column-major 8x8, the top-left 2x2 block has offsets {?,?,?,?}.
-    # your guess:
+    # your guess: {0, 1, 8, 9}
 
 
 # ----------------------------------------------------------------
@@ -220,15 +220,15 @@ def task5():
     flat = cute.make_layout((8, 8), stride=(8, 1))
     tiled = cute.tiled_divide(flat, (2, 2))
     direct = flat((5, 3))
-    via_tile = tiled(((???, ???), ???, ???))
+    via_tile = tiled(((1, 1), 2, 1))
     cute.printf("direct={}  via_tile={}  (must match)", direct, via_tile)
 
 
 if __name__ == "__main__":
     explore()
     # Uncomment as you complete each task:
-    # task1()
-    # task2()
-    # task3()
-    # task4()
-    # task5()
+    task1()
+    task2()
+    task3()
+    task4()
+    task5()
