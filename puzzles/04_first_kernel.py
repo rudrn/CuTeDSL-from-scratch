@@ -2,72 +2,123 @@
 Puzzle #4 — Your first CuTe kernel: vector add on the GPU.
 
 ================================================================
-WHAT YOU'RE BUILDING
+THE GOAL
 ================================================================
 
-A naive elementwise C = A + B kernel, with one thread per element.
-Embarrassingly parallel — but you'll see the WHOLE scaffolding
-that EVERY CuTe kernel uses. Once this works, more complex
-kernels are just "more interesting math inside the kernel."
+Compute C = A + B on the GPU, one thread per element.
+Simple math, but you'll wire up every piece a real CuTe kernel needs.
 
 ================================================================
-THE THREE INGREDIENTS
+HOW A CuTe KERNEL IS PUT TOGETHER
 ================================================================
 
-1) DATA — torch tensors on the GPU. CuTe doesn't allocate;
-   we hand it pointers via DLPack.
+Three pieces talk to each other:
 
-       a = torch.randn(M, N, device="cuda", dtype=torch.float16)
-       a_ = from_dlpack(a, assumed_align=16)
-                       # ^ wraps a's pointer as a CuTe tensor
+1) TENSORS on the GPU.
+   torch allocates them; CuTe wraps the pointer with from_dlpack.
 
-2) KERNEL — code each thread runs. Decorated @cute.kernel.
-   Inside, ask "who am I?" via cute.arch.thread_idx() etc.,
-   then do your work.
+       a  = torch.randn(M, N, device="cuda", dtype=torch.float16)
+       a_ = from_dlpack(a, assumed_align=16)   # CuTe view of `a`
 
-3) HOST FUNCTION — decorated @cute.jit. Computes a launch
-   configuration (grid + block) and calls kernel.launch(...).
+   What does assumed_align=16 mean?
+       "Trust me — this tensor's base pointer is 16-byte aligned."
+       With that promise, the compiler may emit wide vectorized loads
+       (LD.128 = 16 bytes = 8x fp16 in one transaction) instead of
+       conservative narrow ones. Big throughput win.
 
-The full pipeline:
-       cute.compile(host_fn, *cute_tensors)  -> compiled callable
-       compiled(*cute_tensors)               -> runs on GPU
-       torch.testing.assert_close(c, a + b)  -> sanity check
+       It's safe here because torch's CUDA allocator always returns
+       256-byte-aligned pointers. But it's an UNCHECKED assumption:
+       lie about it (e.g. on an oddly-offset slice) and you get
+       undefined behavior. Lower it to 8 or 4 if unsure.
+
+2) THE KERNEL — what each thread does. Marked @cute.kernel.
+   A thread asks "who am I?" and then does its share of work:
+
+       tidx = thread index inside the block   (cute.arch.thread_idx())
+       bidx = block  index inside the grid    (cute.arch.block_idx())
+       bdim = threads per block               (cute.arch.block_dim())
+
+3) THE HOST FUNCTION — picks the launch shape. Marked @cute.jit.
+   It decides grid/block sizes and fires the kernel.
+
+Pipeline:
+       compiled = cute.compile(host_fn, *cute_tensors)
+       compiled(*cute_tensors)                    # runs on GPU
+       torch.testing.assert_close(c, a + b)       # check
 
 ================================================================
-THE KERNEL — annotated
+THE MENTAL MODEL — read this BEFORE the code
 ================================================================
+
+A @cute.kernel function is NOT a function in the Python sense.
+It is a description of what ONE GPU thread does.
+
+When the kernel launches, the hardware spawns ~1,000,000 copies of
+this function and runs them in parallel. Each copy executes the
+body EXACTLY ONCE, with its own thread/block ids.
+
+So when you read the kernel body, picture yourself as one
+anonymous worker in a huge crowd:
+
+    "Who am I?"             -> read thread_idx / block_idx
+    "What's my unique id?"  -> i = bidx * bdim + tidx
+    "Which cell is mine?"   -> row, col = i // n, i % n
+    "Do my one piece."      -> gC[row, col] = gA[row, col] + gB[row, col]
+
+This is why:
+
+  * `i`, `row`, `col` are computed ONCE — each thread has only one
+    cell to handle. There is NO Python `for` loop over elements;
+    the "loop" is the hardware launching a million threads at once.
+
+  * There is NO `return`. The result of the kernel is the SIDE
+    EFFECT of writing into gC. With a million threads running,
+    there is no single value to return — the memory IS the answer.
+
+================================================================
+THE KERNEL — now read the code
+================================================================
+
+Every CuTe kernel follows the same four steps:
+
+  Step 1 — ask "who am I?"        (thread_idx, block_idx, block_dim)
+  Step 2 — turn that into one     global id `i` unique across the launch
+  Step 3 — map `i` to a tensor    coordinate (here: flat -> (row, col))
+  Step 4 — do the work            (load, compute, store)
 
 @cute.kernel
 def add_kernel(gA, gB, gC):
-    tidx, _, _ = cute.arch.thread_idx()   # which thread inside this block
-    bidx, _, _ = cute.arch.block_idx()    # which block inside the grid
-    bdim, _, _ = cute.arch.block_dim()    # how many threads per block
+    # Step 1: who am I?
+    tidx, _, _ = cute.arch.thread_idx()   # 0 .. block_dim-1
+    bidx, _, _ = cute.arch.block_idx()    # 0 .. grid_dim-1
+    bdim, _, _ = cute.arch.block_dim()    # threads per block
 
-    # Global thread id — uniquely names this thread among ALL threads in the launch.
+    # Step 2: my unique id across the whole launch.
     i = bidx * bdim + tidx
 
-    # Map flat id -> 2D (row, col).
-    m, n = gA.shape
-    row = i // n
-    col = i %  n
+    # Step 3: flat id -> (row, col).
+    _, n = gA.shape
+    row, col = i // n, i % n
 
-    # Load, compute, store. The tensor `gA` knows its layout, so
-    # gA[row, col] does the address math for us.
+    # Step 4: one element of the work.
     gC[row, col] = gA[row, col] + gB[row, col]
 
+(With M=N=1024 and 256 threads/block, the launch covers every element
+exactly once — no leftover threads, so no bounds check needed yet.)
+
 ================================================================
-LAUNCH MATH (don't skip — this trips up everyone the first time)
+HOW MANY BLOCKS DO WE LAUNCH?
 ================================================================
 
-Total elements   = M * N
-Threads / block  = 256
-Blocks needed    = (M * N) / 256       (assuming it divides evenly)
+One thread per element, so:
 
-If M=1024, N=1024:
-       total = 1,048,576 elements
+       total threads = M * N
+       blocks        = (M * N) / threads_per_block
+
+Example with M=N=1024 and 256 threads/block:
+       total  = 1024 * 1024 = 1,048,576
        blocks = 1,048,576 / 256 = 4096
-       launch: grid=(4096,1,1) block=(256,1,1)
-       => 4096 * 256 = 1,048,576 threads — one per element.
+       launch: grid=(4096, 1, 1), block=(256, 1, 1)
 
 ================================================================
 PREDICT
@@ -75,18 +126,18 @@ PREDICT
 
 Q1. With M=1024, N=1024, threads_per_block=256, how many
     THREAD BLOCKS does the launch create?
-    your guess:
+    your guess: 4096
 
 Q2. If thread tidx=0 is in block bidx=0, what (row, col) does it
     process?
-    your guess:
+    your guess: (0, 0)
 
 Q3. If thread tidx=5 is in block bidx=3, what global element
     index does it touch? (i.e. row*N + col)
-    your guess:
+    your guess: 518
 
 Q4. We pick threads_per_block=256. Why is 256 (and not, say, 100)?
-    your guess:
+    your guess: to divide evenly
 
 ================================================================
 """
@@ -105,41 +156,41 @@ from cutlass.cute.runtime import from_dlpack
 ################################################################
 
 
-@cute.kernel
-def add_kernel(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
-):
-    # TODO 1: get this thread's id within its block, the block's id in the grid,
-    #         and the block size. Use cute.arch.thread_idx(), block_idx(), block_dim().
-    #         Each returns a 3-tuple (x, y, z) — we only need x.
-    tidx, _, _ = ???
-    bidx, _, _ = ???
-    bdim, _, _ = ???
-
-    # TODO 2: compute a global thread id `i` so that every thread has a UNIQUE i.
-    #         Formula: i = (which block) * (threads per block) + (which thread in block)
-    i = ???
-
-    # TODO 3: convert flat index i to a 2D (row, col) coordinate.
-    #         Hint: gA.shape gives (m, n). Use // and % .
-    m, n = gA.shape
-    row = ???
-    col = ???
-
-    # TODO 4: do the actual work — write A[row,col] + B[row,col] into C[row,col].
-    gC[row, col] = ???
+@cute.kernel                                                                                                                                                                                                                                                                                                                                        
+def add_kernel(                                                                                                                                                                                                                                                                                                                                     
+    gA: cute.Tensor,                                                                                                                                                                                                                                                                                                                                
+    gB: cute.Tensor,                                                                                                                                                                                                                                                                                                                                
+    gC: cute.Tensor,                                                                                                                                                                                                                                                                                                                                
+):                                                                                                                                                                                                                                                                                                                                                  
+    # TODO 1: get this thread's id within its block, the block's id in the grid,                                                                                                                                                                                                                                                                    
+    #         and the block size. Use cute.arch.thread_idx(), block_idx(), block_dim().                                                                                                                                                                                                                                                             
+    #         Each returns a 3-tuple (x, y, z) — we only need x.                                                                                                                                                                                                                                                                                    
+    tidx, _, _ = cute.arch.thread_idx()                                                                                                                                                                                                                                                                                                             
+    bidx, _, _ = cute.arch.block_idx()                                                                                                                                                                                                                                                                                                              
+    bdim, _, _ = cute.arch.block_dim()                                                                                                                                                                                                                                                                                                              
+                                                                                                                                                                                                                                                                                                                                                    
+    # TODO 2: compute a global thread id `i` so that every thread has a UNIQUE i.                                                                                                                                                                                                                                                                   
+    #         Formula: i = (which block) * (threads per block) + (which thread in block)                                                                                                                                                                                                                                                            
+    i = bidx * bdim + tidx                                                                                                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                                                                                                    
+    # TODO 3: convert flat index i to a 2D (row, col) coordinate.                                                                                                                                                                                                                                                                                   
+    #         Hint: gA.shape gives (m, n). Use // and % .                                                                                                                                                                                                                                                                                           
+    m, n = gA.shape                                                                                                                                                                                                                                                                                                                                 
+    row = i // n                                                                                                                                                                                                                                                                                                                                    
+    col = i % n                                                                                                                                                                                                                                                                                                                                     
+                                                                                                                                                                                                                                                                                                                                                    
+    # TODO 4: do the actual work — write A[row,col] + B[row,col] into C[row,col].                                                                                                                                                                                                                                                                   
+    gC[row, col] = gA[row, col] + gB[row, col] 
 
 
 @cute.jit
-def add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
-    threads_per_block = 256
+def add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor) -> None:
+    threads_per_block: int = 256
     m, n = mA.shape
 
     # TODO 5: compute number of blocks needed so that
     #         num_blocks * threads_per_block == m * n.
-    num_blocks = ???
+    num_blocks = (m * n) // threads_per_block
 
     add_kernel(mA, mB, mC).launch(
         grid=(num_blocks, 1, 1),
@@ -147,12 +198,13 @@ def add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     )
 
 
-def main():
-    M, N = 1024, 1024  # 1M elements — small enough to be quick, big enough to be real
+def main() -> None:
+    M: int = 1024
+    N: int = 1024  # 1M elements total — small enough to be quick, big enough to be real
 
-    a = torch.randn(M, N, device="cuda", dtype=torch.float16)
-    b = torch.randn(M, N, device="cuda", dtype=torch.float16)
-    c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
+    a: torch.Tensor = torch.randn(M, N, device="cuda", dtype=torch.float16)
+    b: torch.Tensor = torch.randn(M, N, device="cuda", dtype=torch.float16)
+    c: torch.Tensor = torch.zeros(M, N, device="cuda", dtype=torch.float16)
 
     a_ = from_dlpack(a, assumed_align=16)
     b_ = from_dlpack(b, assumed_align=16)
